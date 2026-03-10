@@ -4,7 +4,9 @@ Follows reference's build_journey_graph() step by step:
   Reference: User nodes -> Product nodes -> Session+Event groupby -> temporal chain
   Ours: Account nodes -> Feature nodes -> Event groupby(account_id) -> temporal chain
 
-Additional edges: Account->Feature, Account->Campaign, Account->Ticket, Ticket->Feature.
+Additional nodes: Tenant, User, Subscription, FeatureRequest
+Additional edges: HAS_TENANT, BELONGS_TO, WORKS_IN, SUBSCRIBED, PERFORMED,
+                  REQUESTED_BY, SUBMITTED, RELATES_TO (feature requests)
 """
 
 import os
@@ -39,13 +41,44 @@ CATEGORY_FEATURE_MAP = {
     },
 }
 
+# Maps feature request categories to related features
+FR_CATEGORY_FEATURE_MAP = {
+    "sosafe": {
+        "Reporting & Analytics": ["human_risk_os"],
+        "Integration": ["sso", "scim"],
+        "Compliance": ["human_risk_os", "advanced_phishing"],
+        "Campaign Management": ["basic_phishing", "advanced_phishing"],
+        "Content Library": ["elearning"],
+        "Automation": ["sofie"],
+        "API & Extensibility": ["sso", "scim"],
+    },
+    "synthflow": {
+        "Voice Quality": ["voice_agents", "custom_voices"],
+        "Integration": ["crm_integration"],
+        "Analytics & Reporting": ["analytics_dashboard"],
+        "Call Management": ["call_routing"],
+        "Agent Builder": ["voice_agents"],
+        "API & Webhooks": ["api_access"],
+        "Multi-language": ["multi_language"],
+    },
+}
+
+
+def _load_table_safe(table: str, company: str) -> pd.DataFrame:
+    """Load a table, returning empty DataFrame if it doesn't exist."""
+    try:
+        return read_df(table, company)
+    except Exception:
+        return pd.DataFrame()
+
 
 def build_journey_graph(company: str) -> nx.DiGraph:
     """Build a directed graph from SQLite tables.
 
-    Node types: Account, Feature, Campaign, Event, Ticket
+    Node types: Account, Feature, Campaign, Event, Ticket, Tenant, User, Subscription, FeatureRequest
     Edge types: GENERATED, NEXT, ENTITLED_TO, ACTIVATED, RAN, PRODUCED,
-                FILED, RELATES_TO
+                FILED, RELATES_TO, HAS_TENANT, BELONGS_TO, WORKS_IN,
+                SUBSCRIBED, PERFORMED, REQUESTED_BY, SUBMITTED
     """
     G = nx.DiGraph()
 
@@ -55,13 +88,14 @@ def build_journey_graph(company: str) -> nx.DiGraph:
     campaigns = read_df("campaigns", company)
     events = read_df("events", company)
 
-    # Check for optional unstructured tables
-    try:
-        tickets = read_df("support_tickets", company)
-    except Exception:
-        tickets = pd.DataFrame()
+    # Optional tables
+    tickets = _load_table_safe("support_tickets", company)
+    tenants = _load_table_safe("tenants", company)
+    users = _load_table_safe("users", company)
+    subscriptions = _load_table_safe("subscriptions", company)
+    feature_requests = _load_table_safe("feature_requests", company)
 
-    # --- Stage 1: Account nodes (like reference's User nodes) ---
+    # --- Stage 1: Account nodes ---
     print("  Adding account nodes...")
     for _, acct in accounts.iterrows():
         G.add_node(
@@ -78,7 +112,7 @@ def build_journey_graph(company: str) -> nx.DiGraph:
             churn_date=acct.get("churn_date"),
         )
 
-    # --- Stage 2: Feature nodes (like reference's Product nodes) ---
+    # --- Stage 2: Feature nodes ---
     print("  Adding feature nodes...")
     feature_names = activations["feature"].unique()
     for feat in feature_names:
@@ -121,11 +155,10 @@ def build_journey_graph(company: str) -> nx.DiGraph:
             edge_type="RAN",
         )
 
-    # --- Stage 5: Event nodes with temporal chain (like reference's Session+Event groupby) ---
+    # --- Stage 5: Event nodes with temporal chain ---
     print("  Adding event nodes and temporal chains...")
     events_sorted = events.sort_values("timestamp")
 
-    # Group events by account_id, build temporal chain per account
     for account_id, acct_events in events_sorted.groupby("account_id"):
         acct_events = acct_events.sort_values("timestamp")
         prev_event_node = None
@@ -140,8 +173,6 @@ def build_journey_graph(company: str) -> nx.DiGraph:
             }
             if pd.notna(evt.get("campaign_id")):
                 attrs["campaign_id"] = evt["campaign_id"]
-            if pd.notna(evt.get("count")):
-                attrs["count"] = int(evt["count"])
 
             G.add_node(evt_node, **attrs)
 
@@ -158,6 +189,12 @@ def build_journey_graph(company: str) -> nx.DiGraph:
                 if G.has_node(cmp_node):
                     G.add_edge(cmp_node, evt_node, edge_type="PRODUCED")
 
+            # User -> Event PERFORMED edge (if user_id present)
+            if "user_id" in evt.index and pd.notna(evt.get("user_id")):
+                user_node = f"user_{evt['user_id']}"
+                if G.has_node(user_node):
+                    G.add_edge(user_node, evt_node, edge_type="PERFORMED")
+
             # Temporal chain: Event -> NEXT -> Event
             if prev_event_node is not None:
                 G.add_edge(prev_event_node, evt_node, edge_type="NEXT")
@@ -166,7 +203,7 @@ def build_journey_graph(company: str) -> nx.DiGraph:
         if (int(account_id.split("-")[1]) % 50 == 0):
             print(f"    Processed events for {account_id}")
 
-    # --- Stage 6: Ticket nodes and edges (if unstructured data exists) ---
+    # --- Stage 6: Ticket nodes and edges ---
     if len(tickets) > 0:
         print("  Adding ticket nodes...")
         for _, tkt in tickets.iterrows():
@@ -182,14 +219,12 @@ def build_journey_graph(company: str) -> nx.DiGraph:
                 created_at=tkt.get("created_at", ""),
             )
 
-            # Account -> Ticket edge
             if pd.notna(tkt.get("account_id")):
                 G.add_edge(
                     f"account_{tkt['account_id']}", tkt_node,
                     edge_type="FILED",
                 )
 
-            # Ticket -> Feature edge (RELATES_TO via category lookup)
             category = tkt.get("category", "")
             category_map = CATEGORY_FEATURE_MAP.get(company, {})
             if category in category_map:
@@ -197,6 +232,125 @@ def build_journey_graph(company: str) -> nx.DiGraph:
                     feat_node = f"feature_{feat}"
                     if G.has_node(feat_node):
                         G.add_edge(tkt_node, feat_node, edge_type="RELATES_TO")
+
+    # --- Stage 7: Tenant nodes and edges ---
+    if len(tenants) > 0:
+        print("  Adding tenant nodes...")
+        for _, tnt in tenants.iterrows():
+            tnt_node = f"tenant_{tnt['tenant_id']}"
+            G.add_node(
+                tnt_node,
+                node_type="Tenant",
+                tenant_id=tnt["tenant_id"],
+                domain=tnt.get("domain", ""),
+                created_at=tnt.get("created_at", ""),
+                setup_completion=tnt.get("setup_completion", 0),
+                environment=tnt.get("environment", ""),
+                user_limit=tnt.get("user_limit", 0),
+                active_users=tnt.get("active_users", 0),
+            )
+
+            # Account -> Tenant (HAS_TENANT)
+            if pd.notna(tnt.get("account_id")):
+                G.add_edge(
+                    f"account_{tnt['account_id']}", tnt_node,
+                    edge_type="HAS_TENANT",
+                )
+
+    # --- Stage 8: User nodes and edges ---
+    if len(users) > 0:
+        print("  Adding user nodes...")
+        for _, usr in users.iterrows():
+            usr_node = f"user_{usr['user_id']}"
+            G.add_node(
+                usr_node,
+                node_type="User",
+                user_id=usr["user_id"],
+                name=usr.get("name", ""),
+                role=usr.get("role", ""),
+                department=usr.get("department", ""),
+                status=usr.get("status", ""),
+                created_at=usr.get("created_at", ""),
+                last_active=usr.get("last_active", ""),
+            )
+
+            # User -> Account (BELONGS_TO)
+            if pd.notna(usr.get("account_id")):
+                G.add_edge(
+                    usr_node, f"account_{usr['account_id']}",
+                    edge_type="BELONGS_TO",
+                )
+
+            # User -> Tenant (WORKS_IN)
+            if pd.notna(usr.get("tenant_id")) and usr.get("tenant_id"):
+                tnt_node = f"tenant_{usr['tenant_id']}"
+                if G.has_node(tnt_node):
+                    G.add_edge(usr_node, tnt_node, edge_type="WORKS_IN")
+
+    # --- Stage 9: Subscription nodes and edges ---
+    if len(subscriptions) > 0:
+        print("  Adding subscription nodes...")
+        for _, sub in subscriptions.iterrows():
+            sub_node = f"subscription_{sub['subscription_id']}"
+            G.add_node(
+                sub_node,
+                node_type="Subscription",
+                subscription_id=sub["subscription_id"],
+                plan_tier=sub.get("plan_tier", ""),
+                mrr=sub.get("mrr", 0),
+                arr=sub.get("arr", 0),
+                start_date=sub.get("start_date", ""),
+                end_date=sub.get("end_date", ""),
+                change_type=sub.get("change_type", ""),
+                seats=sub.get("seats", 0),
+            )
+
+            # Account -> Subscription (SUBSCRIBED)
+            if pd.notna(sub.get("account_id")):
+                G.add_edge(
+                    f"account_{sub['account_id']}", sub_node,
+                    edge_type="SUBSCRIBED",
+                )
+
+    # --- Stage 10: Feature request nodes and edges ---
+    if len(feature_requests) > 0:
+        print("  Adding feature request nodes...")
+        fr_category_map = FR_CATEGORY_FEATURE_MAP.get(company, {})
+
+        for _, fr in feature_requests.iterrows():
+            fr_node = f"feature_request_{fr['request_id']}"
+            G.add_node(
+                fr_node,
+                node_type="FeatureRequest",
+                request_id=fr["request_id"],
+                title=fr.get("title", ""),
+                category=fr.get("category", ""),
+                priority=fr.get("priority", ""),
+                status=fr.get("status", ""),
+                votes=fr.get("votes", 0),
+                submitted_at=fr.get("submitted_at", ""),
+            )
+
+            # Account -> FeatureRequest (REQUESTED_BY)
+            if pd.notna(fr.get("account_id")):
+                G.add_edge(
+                    f"account_{fr['account_id']}", fr_node,
+                    edge_type="REQUESTED_BY",
+                )
+
+            # User -> FeatureRequest (SUBMITTED)
+            if pd.notna(fr.get("user_id")) and fr.get("user_id"):
+                user_node = f"user_{fr['user_id']}"
+                if G.has_node(user_node):
+                    G.add_edge(user_node, fr_node, edge_type="SUBMITTED")
+
+            # FeatureRequest -> Feature (RELATES_TO)
+            category = fr.get("category", "")
+            if category in fr_category_map:
+                for feat in fr_category_map[category]:
+                    feat_node = f"feature_{feat}"
+                    if G.has_node(feat_node):
+                        G.add_edge(fr_node, feat_node, edge_type="RELATES_TO")
 
     return G
 

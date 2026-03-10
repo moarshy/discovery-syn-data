@@ -1,13 +1,14 @@
 """Claude-powered unstructured text generation for B2B SaaS.
 
-Generates support tickets, customer transcripts, reviews, and churn reasons
-conditioned on account context from the structured data in SQLite.
+Generates support tickets, customer transcripts, reviews, churn reasons,
+and feature requests conditioned on account context from the structured data in SQLite.
 
 Uses asyncio with 10 concurrent workers for ~6x speedup over serial.
 """
 
 import asyncio
 import json
+import random
 import sys
 
 import anthropic
@@ -25,6 +26,11 @@ COMPANY_CONFIG = {
             "Report Button Installation", "SSO/SCIM Setup", "Dashboard/Analytics",
             "Billing/Licensing", "Feature Request", "Bug Report", "Training Content",
         ],
+        "feature_request_categories": [
+            "Reporting & Analytics", "Integration", "Compliance",
+            "User Experience", "Campaign Management", "Content Library",
+            "Automation", "API & Extensibility", "Mobile", "Localization",
+        ],
         "system_prompt": (
             "You are a synthetic data generator for a B2B SaaS cybersecurity awareness platform "
             "(similar to SoSafe). Generate realistic business data that reflects real-world patterns. "
@@ -37,6 +43,11 @@ COMPANY_CONFIG = {
             "Agent Configuration", "Call Quality", "CRM Integration",
             "Telephony Setup", "Voice Cloning", "API/Webhooks",
             "Billing/Usage", "Feature Request", "Bug Report", "Latency/Performance",
+        ],
+        "feature_request_categories": [
+            "Voice Quality", "Integration", "Analytics & Reporting",
+            "Call Management", "Agent Builder", "API & Webhooks",
+            "Multi-language", "Compliance", "Automation", "User Experience",
         ],
         "system_prompt": (
             "You are a synthetic data generator for a B2B SaaS AI voice agent platform "
@@ -386,6 +397,90 @@ Return a JSON array:
 
 
 # ---------------------------------------------------------------------------
+# Feature requests (batch 10, 10 concurrent) — Step 5
+# ---------------------------------------------------------------------------
+
+async def generate_feature_requests(company: str, n: int = 250) -> pd.DataFrame:
+    client = anthropic.AsyncAnthropic()
+    sem = asyncio.Semaphore(MAX_WORKERS)
+    config = COMPANY_CONFIG.get(company, COMPANY_CONFIG["sosafe"])
+    accounts = read_df("accounts", company)
+    activations = read_df("feature_activations", company)
+
+    # Load users table to pick submitters
+    try:
+        users = read_df("users", company)
+    except Exception:
+        users = pd.DataFrame()
+
+    rng = random.Random(44_001)
+    batch_size = 10
+    n_batches = n // batch_size
+
+    async def _one_batch(batch_idx):
+        sample_accts = accounts.sample(batch_size, replace=True, random_state=rng.randint(0, 100_000))
+        acct_contexts = []
+        user_ids = []
+        for _, row in sample_accts.iterrows():
+            ctx = _build_account_context(row, activations)
+            # Pick a random admin/manager user if users table exists
+            submitter_id = None
+            if len(users) > 0:
+                admin_mgr = users[
+                    (users["account_id"] == row["account_id"])
+                    & (users["role"].isin(["admin", "manager"]))
+                ]
+                if len(admin_mgr) > 0:
+                    submitter_id = admin_mgr.sample(1, random_state=rng.randint(0, 100_000)).iloc[0]["user_id"]
+            ctx["submitter_user_id"] = submitter_id
+            acct_contexts.append(ctx)
+            user_ids.append(submitter_id)
+
+        categories = json.dumps(config.get("feature_request_categories", []))
+        prompt = f"""Generate exactly {batch_size} realistic ProductBoard-style feature requests for a {config["domain_description"]}.
+
+Account contexts (one request per account):
+{json.dumps(acct_contexts, indent=2)}
+
+Guidelines:
+- Accounts with many unactivated features should request improvements to those features
+- Higher-tier accounts request advanced integrations and enterprise features
+- Churned accounts may have submitted requests that went unaddressed
+- Status distribution: 40% under_review, 25% planned, 20% in_progress, 10% completed, 5% declined
+- Priority distribution: 20% critical, 30% high, 35% medium, 15% low
+- Votes should correlate with how broadly applicable the feature is (1-50)
+
+Categories to use: {categories}
+
+Return a JSON array with {batch_size} objects:
+{{"account_id": "ACC-XXXX", "user_id": "USR-XXXXX or null", "title": "short feature title", "description": "2-4 sentences describing the feature request with business context", "category": "...", "priority": "critical|high|medium|low", "status": "under_review|planned|in_progress|completed|declined", "votes": 1-50, "submitted_at": "YYYY-MM-DD", "updated_at": "YYYY-MM-DD"}}"""
+
+        try:
+            response = await _call_claude(client, prompt, sem, system=config["system_prompt"])
+            batch_requests = _parse_json_response(response)
+            if isinstance(batch_requests, list):
+                for i, fr in enumerate(batch_requests):
+                    fr["request_id"] = f"FR-{batch_idx * batch_size + i + 1:04d}"
+                    # Ensure user_id is set from our known users
+                    if i < len(user_ids) and user_ids[i]:
+                        fr["user_id"] = user_ids[i]
+                return batch_requests
+        except (json.JSONDecodeError, RuntimeError) as e:
+            print(f"  Warning: Failed batch {batch_idx}: {e}")
+        return []
+
+    tasks = [_one_batch(i) for i in range(n_batches)]
+    results = []
+    for coro in atqdm(asyncio.as_completed(tasks), total=n_batches, desc="Feature requests"):
+        results.extend(await coro)
+
+    df = pd.DataFrame(results)
+    write_df(df, "feature_requests", company)
+    print(f"Generated {len(df)} feature requests")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -393,17 +488,20 @@ async def generate_all(company: str):
     """Generate all unstructured data for a company with parallel workers."""
     print(f"\n=== Generating unstructured data for {company} (max {MAX_WORKERS} workers) ===\n")
 
-    print("1/4 Support tickets (500)...")
+    print("1/5 Support tickets (500)...")
     await generate_support_tickets(company, 500)
 
-    print("\n2/4 Transcripts (50)...")
+    print("\n2/5 Transcripts (50)...")
     await generate_transcripts(company, 50)
 
-    print("\n3/4 Reviews (100)...")
+    print("\n3/5 Reviews (100)...")
     await generate_reviews(company, 100)
 
-    print("\n4/4 Churn reasons...")
+    print("\n4/5 Churn reasons...")
     await generate_churn_reasons(company)
+
+    print("\n5/5 Feature requests (250)...")
+    await generate_feature_requests(company, 250)
 
     print(f"\nUnstructured data generation complete for {company}")
 

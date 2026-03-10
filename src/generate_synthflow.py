@@ -4,6 +4,7 @@ Follows the reference generate_data.py pattern: segment dict, state machine even
 generate_all() orchestration writing to SQLite via db.py.
 """
 
+import json
 import random
 from datetime import datetime, timedelta
 
@@ -41,6 +42,7 @@ PLAN_TIERS = {
         "login_freq": (2, 5),       # admin logins per month
         "campaign_freq": (1, 3),    # campaigns per quarter
         "entitled_features": ["voice_agents", "call_routing"],
+        "user_range": (5, 20),
     },
     "Growth": {
         "ratio": 0.35,
@@ -51,6 +53,7 @@ PLAN_TIERS = {
         "entitled_features": [
             "voice_agents", "call_routing", "crm_integration", "analytics_dashboard",
         ],
+        "user_range": (15, 50),
     },
     "Enterprise": {
         "ratio": 0.25,
@@ -62,6 +65,7 @@ PLAN_TIERS = {
             "voice_agents", "call_routing", "crm_integration", "analytics_dashboard",
             "custom_voices", "api_access",
         ],
+        "user_range": (30, 80),
     },
     "Agency": {
         "ratio": 0.10,
@@ -73,8 +77,11 @@ PLAN_TIERS = {
             "voice_agents", "call_routing", "crm_integration", "analytics_dashboard",
             "custom_voices", "api_access", "sla_support", "multi_language",
         ],
+        "user_range": (50, 150),
     },
 }
+
+TIER_ORDER = list(PLAN_TIERS.keys())
 
 FEATURES = [
     {"name": "voice_agents", "activation_difficulty": "low"},
@@ -88,6 +95,12 @@ FEATURES = [
 ]
 
 ACTIVATION_PROB = {"low": 0.85, "medium": 0.55, "high": 0.30}
+
+DEPARTMENTS = [
+    "Operations", "Sales", "Marketing", "IT",
+    "Customer Success", "Product", "Engineering", "Support",
+]
+DEPARTMENT_WEIGHTS = [0.18, 0.18, 0.15, 0.13, 0.12, 0.10, 0.08, 0.06]
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +155,109 @@ def generate_accounts(n: int = NUM_ACCOUNTS) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Subscriptions
+# ---------------------------------------------------------------------------
+
+def generate_subscriptions(accounts_df: pd.DataFrame) -> pd.DataFrame:
+    """Generate subscription history per account — plan changes over time."""
+    rng = random.Random(43_001)
+    records = []
+    sub_id = 1
+
+    for _, acct in accounts_df.iterrows():
+        tier = acct["plan_tier"]
+        arr = acct["arr"]
+        cfg = PLAN_TIERS[tier]
+        contract_start = pd.to_datetime(acct["contract_start"]).date()
+        employees = acct["employee_count"]
+        seats = int(employees * rng.uniform(0.3, 0.8))
+        modules = json.dumps(cfg["entitled_features"])
+
+        start = contract_start
+        end = start + timedelta(days=365)
+        current_tier = tier
+        current_arr = arr
+        records.append({
+            "subscription_id": f"SUB-{sub_id:04d}",
+            "account_id": acct["account_id"],
+            "plan_tier": current_tier,
+            "mrr": round(current_arr / 12, 2),
+            "arr": current_arr,
+            "start_date": str(start),
+            "end_date": str(end),
+            "change_type": "initial",
+            "seats": seats,
+            "modules": modules,
+        })
+        sub_id += 1
+
+        n_changes = rng.randint(0, 3)
+        for _ in range(n_changes):
+            start = end
+            roll = rng.random()
+            tier_idx = TIER_ORDER.index(current_tier)
+
+            if roll < 0.70:
+                current_arr = int(current_arr * rng.uniform(0.95, 1.05))
+                change_type = "renewal"
+            elif roll < 0.90:
+                if tier_idx < len(TIER_ORDER) - 1:
+                    current_tier = TIER_ORDER[tier_idx + 1]
+                    new_cfg = PLAN_TIERS[current_tier]
+                    current_arr = int(rng.uniform(*new_cfg["arr_range"]))
+                    modules = json.dumps(new_cfg["entitled_features"])
+                    change_type = "upgrade"
+                else:
+                    current_arr = int(current_arr * rng.uniform(0.95, 1.05))
+                    change_type = "renewal"
+            else:
+                if tier_idx > 0:
+                    current_tier = TIER_ORDER[tier_idx - 1]
+                    new_cfg = PLAN_TIERS[current_tier]
+                    current_arr = int(rng.uniform(*new_cfg["arr_range"]))
+                    modules = json.dumps(new_cfg["entitled_features"])
+                    change_type = "downgrade"
+                else:
+                    current_arr = int(current_arr * rng.uniform(0.95, 1.05))
+                    change_type = "renewal"
+
+            end = start + timedelta(days=365)
+            records.append({
+                "subscription_id": f"SUB-{sub_id:04d}",
+                "account_id": acct["account_id"],
+                "plan_tier": current_tier,
+                "mrr": round(current_arr / 12, 2),
+                "arr": current_arr,
+                "start_date": str(start),
+                "end_date": str(end),
+                "change_type": change_type,
+                "seats": seats,
+                "modules": modules,
+            })
+            sub_id += 1
+
+        if acct["churned"] and acct["churn_date"]:
+            churn_date = pd.to_datetime(acct["churn_date"]).date()
+            records.append({
+                "subscription_id": f"SUB-{sub_id:04d}",
+                "account_id": acct["account_id"],
+                "plan_tier": current_tier,
+                "mrr": 0,
+                "arr": 0,
+                "start_date": str(churn_date),
+                "end_date": str(churn_date),
+                "change_type": "churned",
+                "seats": 0,
+                "modules": "[]",
+            })
+            sub_id += 1
+
+    df = pd.DataFrame(records)
+    print(f"Generated {len(df)} subscriptions")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Feature activations
 # ---------------------------------------------------------------------------
 
@@ -178,6 +294,169 @@ def generate_feature_activations(accounts_df: pd.DataFrame) -> pd.DataFrame:
             })
 
     return pd.DataFrame(records)
+
+
+# ---------------------------------------------------------------------------
+# Tenants
+# ---------------------------------------------------------------------------
+
+def generate_tenants(accounts_df: pd.DataFrame, activations_df: pd.DataFrame) -> pd.DataFrame:
+    """Generate tenant/workspace rows — 1:1 with accounts."""
+    rng = random.Random(43_002)
+    records = []
+
+    for i, (_, acct) in enumerate(accounts_df.iterrows()):
+        acct_acts = activations_df[
+            (activations_df["account_id"] == acct["account_id"])
+            & (activations_df["activated"] == 1)
+        ]
+        activated_set = set(acct_acts["feature"].tolist())
+
+        slug = acct["name"].lower().replace(" ", "-").replace(",", "").replace(".", "")
+        slug = slug[:30]
+        domain = f"{slug}.synthflow.ai"
+
+        user_limit = int(acct["employee_count"] * rng.uniform(0.5, 1.2))
+        if acct["churned"]:
+            active_users = int(user_limit * rng.uniform(0.05, 0.3))
+        else:
+            active_users = int(user_limit * rng.uniform(0.3, 0.9))
+
+        tier = acct["plan_tier"]
+        if tier in ("Enterprise", "Agency"):
+            setup = rng.uniform(0.7, 1.0)
+        else:
+            setup = rng.uniform(0.4, 0.8)
+        if acct["churned"]:
+            setup *= 0.6
+        setup = round(min(setup, 1.0), 2)
+
+        env_roll = rng.random()
+        if env_roll < 0.85:
+            environment = "production"
+        elif env_roll < 0.95:
+            environment = "staging"
+        else:
+            environment = "sandbox"
+
+        records.append({
+            "tenant_id": f"TNT-{i + 1:04d}",
+            "account_id": acct["account_id"],
+            "domain": domain,
+            "created_at": acct["contract_start"],
+            "voice_agents_enabled": int("voice_agents" in activated_set),
+            "crm_enabled": int("crm_integration" in activated_set),
+            "api_enabled": int("api_access" in activated_set),
+            "custom_voice_enabled": int("custom_voices" in activated_set),
+            "user_limit": user_limit,
+            "active_users": active_users,
+            "setup_completion": setup,
+            "environment": environment,
+        })
+
+    df = pd.DataFrame(records)
+    print(f"Generated {len(df)} tenants")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Users
+# ---------------------------------------------------------------------------
+
+def generate_users(accounts_df: pd.DataFrame, tenants_df: pd.DataFrame) -> pd.DataFrame:
+    """Generate individual users per account."""
+    rng = random.Random(43_003)
+    user_fake = Faker()
+    Faker.seed(43_003)
+    records = []
+    user_id = 1
+
+    tenant_map = dict(zip(tenants_df["account_id"], tenants_df["tenant_id"]))
+    domain_map = {}
+    for _, t in tenants_df.iterrows():
+        d = t["domain"]
+        if d.endswith(".synthflow.ai"):
+            d = d[: -len(".synthflow.ai")]
+        domain_map[t["account_id"]] = d + ".com"
+
+    for _, acct in accounts_df.iterrows():
+        tier_cfg = PLAN_TIERS[acct["plan_tier"]]
+        lo, hi = tier_cfg["user_range"]
+        n_users = rng.randint(lo, hi)
+
+        contract_start = pd.to_datetime(acct["contract_start"])
+        tenant_id = tenant_map.get(acct["account_id"], "")
+        email_domain = domain_map.get(acct["account_id"], "example.com")
+
+        for j in range(n_users):
+            if j == 0:
+                role = "admin"
+            else:
+                r = rng.random()
+                if r < 0.05:
+                    role = "admin"
+                elif r < 0.20:
+                    role = "manager"
+                else:
+                    role = "end_user"
+
+            dept = rng.choices(DEPARTMENTS, weights=DEPARTMENT_WEIGHTS, k=1)[0]
+
+            if role == "admin":
+                day_offset = rng.randint(0, 7)
+            else:
+                day_offset = rng.randint(0, 90)
+            created_at = contract_start + timedelta(days=day_offset)
+
+            now = pd.Timestamp.now()
+            if acct["churned"] and acct["churn_date"]:
+                churn_dt = pd.to_datetime(acct["churn_date"])
+                last_active = churn_dt - timedelta(days=rng.randint(0, 60))
+            else:
+                if role == "end_user" and rng.random() < 0.10:
+                    last_active = now - timedelta(days=rng.randint(91, 365))
+                else:
+                    last_active = now - timedelta(days=rng.randint(0, 30))
+
+            if acct["churned"]:
+                s = rng.random()
+                if s < 0.30:
+                    status = "active"
+                elif s < 0.70:
+                    status = "inactive"
+                else:
+                    status = "deprovisioned"
+            else:
+                s = rng.random()
+                if s < 0.85:
+                    status = "active"
+                elif s < 0.95:
+                    status = "inactive"
+                else:
+                    status = "deprovisioned"
+
+            first = user_fake.first_name()
+            last = user_fake.last_name()
+            name = f"{first} {last}"
+            email = f"{first.lower()}.{last.lower()}@{email_domain}"
+
+            records.append({
+                "user_id": f"USR-{user_id:05d}",
+                "account_id": acct["account_id"],
+                "tenant_id": tenant_id,
+                "name": name,
+                "email": email,
+                "role": role,
+                "department": dept,
+                "created_at": str(created_at.date()),
+                "last_active": str(last_active.date()),
+                "status": status,
+            })
+            user_id += 1
+
+    df = pd.DataFrame(records)
+    print(f"Generated {len(df)} users")
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -235,10 +514,18 @@ def generate_campaigns(accounts_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Event state machines (adapted from reference's generate_session_events)
+# Event state machines (per-user rows)
 # ---------------------------------------------------------------------------
 
-def _generate_admin_session(account, event_id, session_ts):
+def _get_account_users(users_df, account_id, role=None):
+    """Get users for an account, optionally filtered by role."""
+    mask = users_df["account_id"] == account_id
+    if role:
+        mask = mask & (users_df["role"] == role)
+    return users_df[mask]
+
+
+def _generate_admin_session(account, event_id, session_ts, user_id=None):
     """State machine: admin login -> dashboard -> optional agent creation."""
     events = []
     ts = session_ts
@@ -246,10 +533,10 @@ def _generate_admin_session(account, event_id, session_ts):
     events.append({
         "event_id": event_id,
         "account_id": account["account_id"],
+        "user_id": user_id,
         "event_type": "admin.login",
         "timestamp": str(ts),
         "campaign_id": None,
-        "count": None,
     })
     event_id += 1
     ts += timedelta(seconds=random.randint(5, 30))
@@ -257,10 +544,10 @@ def _generate_admin_session(account, event_id, session_ts):
     events.append({
         "event_id": event_id,
         "account_id": account["account_id"],
+        "user_id": user_id,
         "event_type": "admin.dashboard_viewed",
         "timestamp": str(ts),
         "campaign_id": None,
-        "count": None,
     })
     event_id += 1
     ts += timedelta(seconds=random.randint(30, 300))
@@ -270,10 +557,10 @@ def _generate_admin_session(account, event_id, session_ts):
         events.append({
             "event_id": event_id,
             "account_id": account["account_id"],
+            "user_id": user_id,
             "event_type": "admin.agent_created",
             "timestamp": str(ts),
             "campaign_id": None,
-            "count": None,
         })
         event_id += 1
         ts += timedelta(seconds=random.randint(60, 600))
@@ -282,154 +569,170 @@ def _generate_admin_session(account, event_id, session_ts):
             events.append({
                 "event_id": event_id,
                 "account_id": account["account_id"],
+                "user_id": user_id,
                 "event_type": "admin.agent_configured",
                 "timestamp": str(ts),
                 "campaign_id": None,
-                "count": None,
             })
             event_id += 1
 
     return events, event_id
 
 
-def _generate_agent_deployment_events(account, campaign_id, event_id, base_ts, target_count):
-    """State machine: voice agent deployment lifecycle."""
+def _generate_agent_deployment_events(account, campaign_id, event_id, base_ts, target_count,
+                                      user_pool, user_rng):
+    """State machine: voice agent deployment per-user lifecycle."""
     events = []
     ts = base_ts
 
-    n_created = min(target_count, random.randint(50, 500))
-    events.append({
-        "event_id": event_id,
-        "account_id": account["account_id"],
-        "event_type": "agent.created",
-        "timestamp": str(ts),
-        "campaign_id": campaign_id,
-        "count": n_created,
-    })
-    event_id += 1
-    ts += timedelta(hours=random.randint(1, 24))
+    n_target = min(target_count, len(user_pool)) if len(user_pool) > 0 else 0
+    if n_target == 0:
+        return events, event_id
 
-    n_configured = int(n_created * random.uniform(0.7, 1.0))
-    events.append({
-        "event_id": event_id,
-        "account_id": account["account_id"],
-        "event_type": "agent.configured",
-        "timestamp": str(ts),
-        "campaign_id": campaign_id,
-        "count": n_configured,
-    })
-    event_id += 1
-    ts += timedelta(hours=random.randint(1, 48))
+    targeted_users = user_rng.sample(list(user_pool["user_id"]), k=min(n_target, len(user_pool)))
 
-    # 80% get deployed
-    n_deployed = int(n_configured * random.uniform(0.7, 0.9)) if random.random() < 0.8 else 0
-    if n_deployed > 0:
+    for uid in targeted_users:
+        user_ts = ts + timedelta(seconds=user_rng.randint(0, 3600))
+
+        # agent.created
         events.append({
             "event_id": event_id,
             "account_id": account["account_id"],
-            "event_type": "agent.deployed",
-            "timestamp": str(ts),
+            "user_id": uid,
+            "event_type": "agent.created",
+            "timestamp": str(user_ts),
             "campaign_id": campaign_id,
-            "count": n_deployed,
         })
         event_id += 1
-        ts += timedelta(hours=random.randint(1, 24))
 
-        # 70% go live and make first call
-        n_live = int(n_deployed * random.uniform(0.6, 0.8)) if random.random() < 0.7 else 0
-        if n_live > 0:
+        # agent.configured (70-100%)
+        if user_rng.random() < user_rng.uniform(0.7, 1.0):
+            user_ts += timedelta(hours=user_rng.randint(1, 24))
             events.append({
                 "event_id": event_id,
                 "account_id": account["account_id"],
-                "event_type": "agent.live",
-                "timestamp": str(ts),
+                "user_id": uid,
+                "event_type": "agent.configured",
+                "timestamp": str(user_ts),
                 "campaign_id": campaign_id,
-                "count": n_live,
             })
             event_id += 1
-            ts += timedelta(minutes=random.randint(1, 30))
 
-            events.append({
-                "event_id": event_id,
-                "account_id": account["account_id"],
-                "event_type": "agent.first_call",
-                "timestamp": str(ts),
-                "campaign_id": campaign_id,
-                "count": n_live,
-            })
-            event_id += 1
+            # agent.deployed (56-72% of configured)
+            if user_rng.random() < user_rng.uniform(0.7, 0.9) and user_rng.random() < 0.8:
+                user_ts += timedelta(hours=user_rng.randint(1, 24))
+                events.append({
+                    "event_id": event_id,
+                    "account_id": account["account_id"],
+                    "user_id": uid,
+                    "event_type": "agent.deployed",
+                    "timestamp": str(user_ts),
+                    "campaign_id": campaign_id,
+                })
+                event_id += 1
+
+                # agent.live + first_call (42-56% of deployed)
+                if user_rng.random() < user_rng.uniform(0.6, 0.8) and user_rng.random() < 0.7:
+                    user_ts += timedelta(minutes=user_rng.randint(1, 30))
+                    events.append({
+                        "event_id": event_id,
+                        "account_id": account["account_id"],
+                        "user_id": uid,
+                        "event_type": "agent.live",
+                        "timestamp": str(user_ts),
+                        "campaign_id": campaign_id,
+                    })
+                    event_id += 1
+
+                    user_ts += timedelta(minutes=user_rng.randint(1, 60))
+                    events.append({
+                        "event_id": event_id,
+                        "account_id": account["account_id"],
+                        "user_id": uid,
+                        "event_type": "agent.first_call",
+                        "timestamp": str(user_ts),
+                        "campaign_id": campaign_id,
+                    })
+                    event_id += 1
 
     return events, event_id
 
 
-def _generate_call_campaign_events(account, campaign_id, event_id, base_ts, target_count):
-    """State machine: outbound calling campaign lifecycle."""
+def _generate_call_campaign_events(account, campaign_id, event_id, base_ts, target_count,
+                                   user_pool, user_rng):
+    """State machine: outbound calling campaign per-user lifecycle."""
     events = []
     ts = base_ts
 
-    n_initiated = min(target_count, random.randint(50, 500))
-    events.append({
-        "event_id": event_id,
-        "account_id": account["account_id"],
-        "event_type": "call.initiated",
-        "timestamp": str(ts),
-        "campaign_id": campaign_id,
-        "count": n_initiated,
-    })
-    event_id += 1
-    ts += timedelta(days=random.randint(1, 7))
+    n_target = min(target_count, len(user_pool)) if len(user_pool) > 0 else 0
+    if n_target == 0:
+        return events, event_id
 
-    # 60-85% connect
-    n_connected = int(n_initiated * random.uniform(0.60, 0.85))
-    events.append({
-        "event_id": event_id,
-        "account_id": account["account_id"],
-        "event_type": "call.connected",
-        "timestamp": str(ts),
-        "campaign_id": campaign_id,
-        "count": n_connected,
-    })
-    event_id += 1
-    ts += timedelta(days=random.randint(3, 14))
+    targeted_users = user_rng.sample(list(user_pool["user_id"]), k=min(n_target, len(user_pool)))
 
-    # 70-90% of connected calls complete
-    n_completed = int(n_connected * random.uniform(0.70, 0.90))
-    n_failed = n_connected - n_completed
-    events.append({
-        "event_id": event_id,
-        "account_id": account["account_id"],
-        "event_type": "call.completed",
-        "timestamp": str(ts),
-        "campaign_id": campaign_id,
-        "count": n_completed,
-    })
-    event_id += 1
+    for uid in targeted_users:
+        user_ts = ts + timedelta(seconds=user_rng.randint(0, 7200))
 
-    if n_failed > 0:
-        ts += timedelta(minutes=random.randint(1, 30))
+        # call.initiated
         events.append({
             "event_id": event_id,
             "account_id": account["account_id"],
-            "event_type": "call.failed",
-            "timestamp": str(ts),
+            "user_id": uid,
+            "event_type": "call.initiated",
+            "timestamp": str(user_ts),
             "campaign_id": campaign_id,
-            "count": n_failed,
         })
         event_id += 1
 
-    # 5-15% of connected calls get transferred
-    n_transferred = int(n_connected * random.uniform(0.05, 0.15))
-    if n_transferred > 0:
-        ts += timedelta(hours=random.randint(1, 72))
-        events.append({
-            "event_id": event_id,
-            "account_id": account["account_id"],
-            "event_type": "call.transferred",
-            "timestamp": str(ts),
-            "campaign_id": campaign_id,
-            "count": n_transferred,
-        })
-        event_id += 1
+        # call.connected (60-85%)
+        if user_rng.random() < user_rng.uniform(0.60, 0.85):
+            user_ts += timedelta(seconds=user_rng.randint(5, 30))
+            events.append({
+                "event_id": event_id,
+                "account_id": account["account_id"],
+                "user_id": uid,
+                "event_type": "call.connected",
+                "timestamp": str(user_ts),
+                "campaign_id": campaign_id,
+            })
+            event_id += 1
+
+            # call.completed (70-90%) vs call.failed
+            if user_rng.random() < user_rng.uniform(0.70, 0.90):
+                user_ts += timedelta(minutes=user_rng.randint(1, 30))
+                events.append({
+                    "event_id": event_id,
+                    "account_id": account["account_id"],
+                    "user_id": uid,
+                    "event_type": "call.completed",
+                    "timestamp": str(user_ts),
+                    "campaign_id": campaign_id,
+                })
+                event_id += 1
+
+                # call.transferred (5-15%)
+                if user_rng.random() < user_rng.uniform(0.05, 0.15):
+                    user_ts += timedelta(minutes=user_rng.randint(1, 10))
+                    events.append({
+                        "event_id": event_id,
+                        "account_id": account["account_id"],
+                        "user_id": uid,
+                        "event_type": "call.transferred",
+                        "timestamp": str(user_ts),
+                        "campaign_id": campaign_id,
+                    })
+                    event_id += 1
+            else:
+                user_ts += timedelta(seconds=user_rng.randint(5, 60))
+                events.append({
+                    "event_id": event_id,
+                    "account_id": account["account_id"],
+                    "user_id": uid,
+                    "event_type": "call.failed",
+                    "timestamp": str(user_ts),
+                    "campaign_id": campaign_id,
+                })
+                event_id += 1
 
     return events, event_id
 
@@ -448,10 +751,10 @@ def _generate_feature_events(account, activations_df, event_id):
             events.append({
                 "event_id": event_id,
                 "account_id": account["account_id"],
+                "user_id": None,
                 "event_type": f"feature.{act['feature']}_activated",
                 "timestamp": str(ts),
                 "campaign_id": None,
-                "count": None,
             })
             event_id += 1
 
@@ -459,21 +762,19 @@ def _generate_feature_events(account, activations_df, event_id):
 
 
 # ---------------------------------------------------------------------------
-# Main events generator (adapted from reference's generate_events)
+# Main events generator (per-user)
 # ---------------------------------------------------------------------------
 
 def generate_events(
     accounts_df: pd.DataFrame,
     campaigns_df: pd.DataFrame,
     activations_df: pd.DataFrame,
-    target: int = TARGET_EVENTS,
+    users_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Generate ~target events using state machine pattern.
-
-    Churned accounts: activity drops 30-60 days before churn_date.
-    """
+    """Generate per-user events using state machine pattern."""
     all_events = []
     event_id = 1
+    user_rng = random.Random(43_004)
 
     for idx, acct in accounts_df.iterrows():
         contract_start = pd.to_datetime(acct["contract_start"])
@@ -492,6 +793,12 @@ def generate_events(
         if acct["churned"]:
             n_sessions = max(1, int(n_sessions * 0.6))
 
+        admin_users = _get_account_users(users_df, acct["account_id"], "admin")
+        manager_users = _get_account_users(users_df, acct["account_id"], "manager")
+        admin_manager_pool = pd.concat([admin_users, manager_users])
+        end_users = _get_account_users(users_df, acct["account_id"], "end_user")
+        all_acct_users = _get_account_users(users_df, acct["account_id"])
+
         for _ in range(n_sessions):
             day_offset = random.randint(0, span_days - 1)
             session_ts = contract_start + timedelta(
@@ -500,27 +807,33 @@ def generate_events(
                 minutes=random.randint(0, 59),
             )
 
-            # Churned accounts: skip ~60% of sessions in the 30-60 days before churn
             if acct["churned"] and acct["churn_date"]:
                 churn_dt = pd.to_datetime(acct["churn_date"])
                 days_before_churn = (churn_dt - session_ts).days
                 if 0 < days_before_churn < 60 and random.random() < 0.6:
                     continue
 
-            evts, event_id = _generate_admin_session(acct, event_id, session_ts)
+            session_user_id = None
+            if len(admin_manager_pool) > 0:
+                session_user_id = user_rng.choice(list(admin_manager_pool["user_id"]))
+
+            evts, event_id = _generate_admin_session(acct, event_id, session_ts, user_id=session_user_id)
             all_events.extend(evts)
 
         # Campaign events
         acct_campaigns = campaigns_df[campaigns_df["account_id"] == acct["account_id"]]
         for _, cmp in acct_campaigns.iterrows():
             launch_ts = pd.to_datetime(cmp["launch_date"])
+            user_pool = end_users if len(end_users) > 0 else all_acct_users
             if cmp["type"] == "agent_deployment":
                 evts, event_id = _generate_agent_deployment_events(
                     acct, cmp["campaign_id"], event_id, launch_ts, cmp["target_count"],
+                    user_pool, user_rng,
                 )
             else:
                 evts, event_id = _generate_call_campaign_events(
                     acct, cmp["campaign_id"], event_id, launch_ts, cmp["target_count"],
+                    user_pool, user_rng,
                 )
             all_events.extend(evts)
 
@@ -529,15 +842,15 @@ def generate_events(
         all_events.extend(evts)
 
         if (idx + 1) % 50 == 0:
-            print(f"  Processed {idx + 1}/{len(accounts_df)} accounts ({len(all_events)} events)")
+            print(f"  Processed {idx + 1}/{len(accounts_df)} accounts ({len(all_events):,} events)")
 
     df = pd.DataFrame(all_events)
-    print(f"Generated {len(df)} events (target: {target})")
+    print(f"Generated {len(df):,} events")
     return df
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator (same pattern as reference's generate_all)
+# Orchestrator
 # ---------------------------------------------------------------------------
 
 def generate_all():
@@ -548,19 +861,31 @@ def generate_all():
     accounts = generate_accounts()
     write_df(accounts, "accounts", company)
 
+    print("Generating subscriptions...")
+    subscriptions = generate_subscriptions(accounts)
+    write_df(subscriptions, "subscriptions", company)
+
     print("Generating feature activations...")
     activations = generate_feature_activations(accounts)
     write_df(activations, "feature_activations", company)
+
+    print("Generating tenants...")
+    tenants = generate_tenants(accounts, activations)
+    write_df(tenants, "tenants", company)
+
+    print("Generating users...")
+    users = generate_users(accounts, tenants)
+    write_df(users, "users", company)
 
     print("Generating campaigns...")
     campaigns = generate_campaigns(accounts)
     write_df(campaigns, "campaigns", company)
 
-    print("Generating events...")
-    events = generate_events(accounts, campaigns, activations)
+    print("Generating events (per-user expansion)...")
+    events = generate_events(accounts, campaigns, activations, users)
     write_df(events, "events", company)
 
-    # Print summary (same pattern as reference)
+    # Print summary
     print("\n=== SynthFlow Data Summary ===")
     for tier in PLAN_TIERS:
         tier_accts = accounts[accounts["plan_tier"] == tier]
@@ -571,14 +896,25 @@ def generate_all():
         )
 
     print(f"\nTotal accounts: {len(accounts)}")
+    print(f"Total subscriptions: {len(subscriptions)}")
     print(
         f"Total feature activations: {len(activations)} "
         f"({activations['activated'].sum()} activated)"
     )
+    print(f"Total tenants: {len(tenants)}")
+    print(f"Total users: {len(users)}")
     print(f"Total campaigns: {len(campaigns)}")
-    print(f"Total events: {len(events)}")
+    print(f"Total events: {len(events):,}")
 
-    return {"accounts": accounts, "activations": activations, "campaigns": campaigns, "events": events}
+    return {
+        "accounts": accounts,
+        "subscriptions": subscriptions,
+        "activations": activations,
+        "tenants": tenants,
+        "users": users,
+        "campaigns": campaigns,
+        "events": events,
+    }
 
 
 if __name__ == "__main__":
